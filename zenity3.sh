@@ -6,7 +6,7 @@ LOG_USUARIO="$HOME/gestor_archivos_user.log"
 #uso el temp para almacenar datos que utilziaré en las operaciones
 #en un principio lo utilicé como depurador en el desarrollo
 #pero he visto que podia darle utilidad.
-TEMP_RESULTS="/tmp/gestor_archivos.tmp"
+TEMP_RESULTS="/tmp/gestor_archivos_$(whoami).tmp"
 
 ## FUNCIONES BÁSICAS ##
 
@@ -22,10 +22,7 @@ iniciar_logs() {
     #log usuario, si por algun casual el primero en iniciar es el usuario
     #se crea tambien el log global, para que luego, como el usuario
     #hará cambios tambien se registre en el global
-    if [ ! -f "$LOG_USUARIO" ] && [ ! -f "$LOG_GLOBAL" ]; then
-	touch "$LOG_GLOBAL"
-        chmod 600 "$LOG_GLOBAL"
-        echo "Iniciado log global en $LOG_GLOBAL" >> "$LOG_GLOBAL"
+    if [ ! -f "$LOG_USUARIO" ]; then
         touch "$LOG_USUARIO"
         chmod 600 "$LOG_USUARIO"
         echo "Iniciado log de usuario en $LOG_USUARIO" >> "$LOG_USUARIO"
@@ -39,16 +36,25 @@ registrar_accion() {
     # Todos registran en su log
     echo "$mensaje" >> "$LOG_USUARIO"
     
-    # Intento registrar en log global
+    # Solo root puede escribir en el global
     if [ "$(id -u)" -eq 0 ]; then
         echo "$mensaje" >> "$LOG_GLOBAL"
-    else
-    #fuerza el uso del comando aun cuando es usuario, para actualizar el log
-        sudo bash -c "echo '$mensaje' >> '$LOG_GLOBAL'" || true
     fi
 }
 
-#a partir de aqui las funciones que permiten hacer las busquedas
+## FUNCIONES DE VERIFICACIÓN ##
+
+# Verifica si el usuario actual es propietario del archivo
+verificar_propietario() {
+    local archivo="$1"
+    if [ "$(id -u)" -ne 0 ] && [ "$(stat -c '%U' "$archivo")" != "$(whoami)" ]; then
+        zenity --warning --text="No tienes permisos sobre $archivo" --width=300
+        return 1
+    fi
+    return 0
+}
+
+## FUNCIONES DE BÚSQUEDA ##
 
 #funcion que busca por criterios
 buscar_archivos() {
@@ -56,50 +62,52 @@ buscar_archivos() {
     local criterios=$(zenity --forms --title="Búsqueda Avanzada" \
         --text="Ingrese los criterios de búsqueda:" \
         --add-entry="Nombre (patrón):" \
-        --add-combo="Tamaño:" --combo-values="|+1M|-1M|+10M|+100M" \
         --add-combo="Tipo:" --combo-values="|Archivo|Directorio|Enlace" \
-        --add-entry="Permisos (ej: 644):" \
-        --add-entry="Usuario propietario:" \
-        --add-entry="Grupo propietario:")
+        --add-entry="Permisos (ej: 644):")
     
     [ -z "$criterios" ] && return 1
 
-    # Parsear criterios
-    local nombre tamano tipo permisos usuario grupo
-    IFS='|' read -r nombre tamano tipo permisos usuario grupo <<< "$criterios"
+    #almacenar criterios de busqueda en un IFS
+    local nombre tipo permisos
+    IFS='|' read -r nombre tipo permisos <<< "$criterios"
 
     #3 dias apra montar este comando.
-	#asignado a variable local comando que contiene find /
-    local comando="find /"
+    #asignado a variable local comando que contiene find /
+    local comando="find"
+    # Root busca en todo el sistema, usuarios solo en su home
+    [ "$(id -u)" -eq 0 ] && comando+=" /" || comando+=" $HOME"
+    
     # si hay contenido en la variable nombre del ifs, hace un append con -name y el nombre
     [ -n "$nombre" ] && comando+=" -name \"$nombre\""
-	#estos 3, solo seleccionas uno, entonces, si el contenido es igual a uno
-	#de los tres, en funcion de cual sea,pues le hara el append de uno o otro
+    #estos 3, solo seleccionas uno, entonces, si el contenido es igual a uno
+    #de los tres, en funcion de cual sea,pues le hara el append de uno o otro
     [ "$tipo" = "Archivo" ] && comando+=" -type f"
     [ "$tipo" = "Directorio" ] && comando+=" -type d"
     [ "$tipo" = "Enlace" ] && comando+=" -type l"
-	# los demás igual que el de nombre, si contienen algo esas variables
-	#hará el append o no
-    [ -n "$tamano" ] && comando+=" -size $tamano"
+    # los demás igual que el de nombre, si contienen algo esas variables
+    #hará el append o no
     [ -n "$permisos" ] && comando+=" -perm $permisos"
-    [ -n "$usuario" ] && comando+=" -user $usuario"
-    [ -n "$grupo" ] && comando+=" -group $grupo"
+    
+    # Para usuarios normales, solo sus archivos
+    [ "$(id -u)" -ne 0 ] && comando+=" -user $(whoami)"
     
     #el eval, que me da la vida, te quitas de algo de sintaxis
-   #lo que ahce es permitir EJECUTAR COMANDOS QUE SE ENCUENTRAN DENTRO DE VARIABLES
-   #LO EJECUTA Y LO DEJA EN TEMP_RESULTS
+    #lo que ahce es permitir EJECUTAR COMANDOS QUE SE ENCUENTRAN DENTRO DE VARIABLES
+    #LO EJECUTA Y LO DEJA EN TEMP_RESULTS
     eval "$comando" > "$TEMP_RESULTS"
     #si existe, que haga el input de la informacion que tenemos en temp result
-   #con el mensaje personalizado
+    #con el mensaje personalizado
     if [ -s "$TEMP_RESULTS" ]; then
         registrar_accion "Búsqueda realizada: $(wc -l < "$TEMP_RESULTS") resultados"
         return 0
     else
-   #si al hacer la busqueda no hay nada en TEMP entrará aqui y dirá el zenity que no hemos encontrado nada
+    #si al hacer la busqueda no hay nada en TEMP entrará aqui y dirá el zenity que no hemos encontrado nada
         zenity --info --title="Resultados" --text="No se encontraron archivos"
         return 1
     fi
 }
+
+## FUNCIONES DE GESTIÓN ##
 
 #cambio de permisos
 cambiar_permisos() {
@@ -127,7 +135,7 @@ cambiar_permisos() {
     # Procesar archivos
     local exitos=0
     while IFS= read -r archivo; do
-        if chmod "$permisos" "$archivo" 2>/dev/null; then
+        if verificar_propietario "$archivo" && chmod "$permisos" "$archivo" 2>/dev/null; then
             ((exitos++))
             registrar_accion "Cambió permisos de $archivo a $permisos"
         fi
@@ -136,19 +144,24 @@ cambiar_permisos() {
     zenity --info --title="Resultado" --text="Permisos cambiados en $exitos archivos"
 }
 
-# Cambiar propietario
+# Cambiar propietario (SOLO ADMIN)
 cambiar_propietario() {
-#archivos recibe la lista de archivos a modificar
+    [ "$(id -u)" -ne 0 ] && {
+        zenity --error --text="Esta función es solo para administradores"
+        return 1
+    }
+
+    #archivos recibe la lista de archivos a modificar
     local archivos="$1"
-#variable nuevo propietario... blah blah blah
+    #variable nuevo propietario... blah blah blah
     local nuevo_prop=$(zenity --entry --title="Nuevo Propietario" \
         --text="Ingrese usuario:grupo nuevo:")
     [ -z "$nuevo_prop" ] && return
-#variable exitos, inicializada a 0, la usaré luego
-#itera sobre todos los archivos, aquellos que si pilla, aumenta contador en 1
+    #variable exitos, inicializada a 0, la usaré luego
+    #itera sobre todos los archivos, aquellos que si pilla, aumenta contador en 1
     local exitos=0
     while IFS= read -r archivo; do
-        if sudo chown "$nuevo_prop" "$archivo"; then
+        if chown "$nuevo_prop" "$archivo"; then
             ((exitos++))
             registrar_accion "Cambió propietario de $archivo a $nuevo_prop"
         fi
@@ -159,13 +172,13 @@ cambiar_propietario() {
 
 # Eliminar archivos
 eliminar_archivos() {
-# de nuevo la lista de archivos
+    # de nuevo la lista de archivos
     local archivos="$1"
     #caballero, esta usted seguro de que sea borrarlos? si no, pa fuera
     zenity --question --title="Confirmar" --text="¿Eliminar los archivos seleccionados?" --width=300
     [ "$?" -ne 0 ] && return
-# si has dicho que si, te preguntará si quieres hacer un backup, es otra funcion
-#la explicaré luego
+    # si has dicho que si, te preguntará si quieres hacer un backup, es otra funcion
+    #la explicaré luego
     zenity --question --title="Backup" --text="¿Crear copia de seguridad?"
     if [ "$?" -eq 0 ]; then
         crear_backup "$archivos"
@@ -175,7 +188,7 @@ eliminar_archivos() {
     # por cada uno que se haga, aumenta el contador, para luego mostrar la cantidad que hemos borrado
     local exitos=0
     while IFS= read -r archivo; do
-        if rm -rf "$archivo"; then
+        if verificar_propietario "$archivo" && rm -rf "$archivo"; then
             ((exitos++))
             registrar_accion "Eliminó archivo: $archivo"
         fi
@@ -187,39 +200,69 @@ eliminar_archivos() {
 #aqui está la funcion backup
 crear_backup() {
     local archivos="$1"
-#funciona por ruta absoluta, esta funcion es de administrador, no deberia de haber problema de permisos
+    #funciona por ruta absoluta, esta funcion es de administrador, no deberia de haber problema de permisos
     local destino=$(zenity --file-selection --directory --title="Seleccione destino para backup")
     [ -z "$destino" ] && return
 
     local dir_backup="$destino/backup_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$dir_backup"
-#de nuevo itera con archivo... blah blah, pero esta vez para que en cada vuelta meta el archivo en el directorio backup
+    #de nuevo itera con archivo... blah blah, pero esta vez para que en cada vuelta meta el archivo en el directorio backup
     while IFS= read -r archivo; do
-        local dir_archivo=$(dirname "$archivo")
-        mkdir -p "$dir_backup$dir_archivo"
-        cp -a "$archivo" "$dir_backup$dir_archivo/"
+        if verificar_propietario "$archivo"; then
+            local dir_archivo=$(dirname "$archivo")
+            mkdir -p "$dir_backup$dir_archivo"
+            cp -a "$archivo" "$dir_backup$dir_archivo/"
+        fi
     done <<< "$archivos"
     
     zenity --info --title="Backup" --text="Copia creada en:\n$dir_backup"
 }
 
-menu_principal() {
+## MENÚS ##
+
+menu_usuario() {
     while true; do
-        local opcion=$(zenity --list --title="Gestor de Archivos" \
+        local opcion=$(zenity --list --title="Gestor de Archivos (Usuario)" \
+            --text="Seleccione una operación:" \
+            --column="ID" --column="Opción" \
+            "1" "Buscar mis archivos" \
+            "2" "Cambiar permisos" \
+            "3" "Ver mis logs" \
+            "4" "Salir")
+        
+        case "$opcion" in
+            "1")
+                if buscar_archivos; then
+                    local archivos=$(cat "$TEMP_RESULTS")
+                    cambiar_permisos "$archivos"
+                fi
+                ;;
+            "2")
+                local archivos=$(zenity --file-selection --multiple --separator=$'\n' --filename="$HOME")
+                [ -n "$archivos" ] && cambiar_permisos "$archivos"
+                ;;
+            "3") ver_logs ;;
+            "4") break ;;
+        esac
+    done
+}
+
+menu_admin() {
+    while true; do
+        local opcion=$(zenity --list --title="Gestor de Archivos (Administrador)" \
             --text="Seleccione una operación:" \
             --column="ID" --column="Opción" \
             "1" "Buscar archivos" \
             "2" "Cambiar permisos" \
             "3" "Cambiar propietario" \
             "4" "Ver logs" \
-            "5" "Salir" )
+            "5" "Salir")
         
         case "$opcion" in
             "1")
                 if buscar_archivos; then
                     local archivos=$(cat "$TEMP_RESULTS")
                     local accion=$(zenity --list --title="Acciones" \
-                        --text="Seleccione acción:" \
                         --column="ID" --column="Acción" \
                         "1" "Cambiar permisos" \
                         "2" "Cambiar propietario" \
@@ -258,17 +301,17 @@ ver_logs() {
         --column="ID" --column="Opción" \
         "1" "Últimas entradas" \
         "2" "Buscar por usuario" \
-#muy facil, exportarlos es crear otro archivo con todo el contenido de log_file, para verlo de forma mas detallada, o por si por algun casual, lo necesitas, porque el pequeño timmy le ha gastado una broma pesada al pequeño jimmy cambiandole los permisos a sus archivos
+        #muy facil, exportarlos es crear otro archivo con todo el contenido de log_file, para verlo de forma mas detallada, o por si por algun casual, lo necesitas, porque el pequeño timmy le ha gastado una broma pesada al pequeño jimmy cambiandole los permisos a sus archivos
         "3" "Exportar logs")
     
     case "$opcion" in
         "1")
-#las ultimas entradas, pues 20 de ellas
+            #las ultimas entradas, pues 20 de ellas
             zenity --text-info --title="Últimas entradas" --filename=<(tail -20 "$log_file") \
                    --width=800 --height=600
             ;;
         "2")
-#si quieres, puedes buscar especificamente por usuario haciendo un simple grep
+            #si quieres, puedes buscar especificamente por usuario haciendo un simple grep
             local usuario=$(zenity --entry --title="Buscar" --text="Ingrese usuario:")
             [ -n "$usuario" ] && zenity --text-info --title="Resultados" \
                                         --filename=<(grep "Usuario: $usuario" "$log_file") \
@@ -287,12 +330,12 @@ ver_logs() {
 iniciar_logs
 
 if [ "$(id -u)" -eq 0 ]; then
-    menu_principal
+    menu_admin
 else
     zenity --info --title="Información" \
-           --text="Algunas funciones requieren permisos de administrador" \
+           --text="Modo usuario: Solo podrá gestionar sus archivos" \
            --width=300
-    menu_principal
+    menu_usuario
 fi
 
 #limpieza de los archivos temporales, con el que jugamos con los datos que obtenemos con los find y otros comandos.
